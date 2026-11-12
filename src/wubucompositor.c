@@ -89,6 +89,8 @@ struct wcc_server {
     const char *shot_path;
     int shot_done;
     int shot_commits;
+    int shot_delay_ms;
+    uint32_t shot_start_ms;
 
     char *xkb_keymap_str;
 
@@ -208,8 +210,13 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r)
         blit(s, surf);
         wl_buffer_send_release(buf_res);
         /* self-screenshot: after a few settled commits, capture and stop. */
-        if (s->shot_path && !s->shot_done && ++s->shot_commits >= 4)
-            wcc_capture_screenshot(s, WC_OUTPUT_W, WC_OUTPUT_H);
+        if (s->shot_path && !s->shot_done) {
+            s->shot_commits++;
+            uint32_t now = now_ms();
+            int due = s->shot_commits >= 4 &&
+                      (int)(now - s->shot_start_ms) >= s->shot_delay_ms;
+            if (due) wcc_capture_screenshot(s, WC_OUTPUT_W, WC_OUTPUT_H);
+        }
     }
     surf->pending_buffer = NULL;
     if (surf->frame_cb) { wl_callback_send_done(surf->frame_cb, now_ms());
@@ -635,14 +642,21 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
 int main(int argc, char **argv)
 {
     const char *shot_path = NULL;
-    for (int i = 1; i + 1 < argc; i++)
+    int shot_delay = 0;
+    for (int i = 1; i + 1 < argc; i++) {
         if (strcmp(argv[i], "--screenshot") == 0) shot_path = argv[i + 1];
+        else if (strcmp(argv[i], "--shot-delay") == 0)
+            shot_delay = atoi(argv[i + 1]);
+    }
 
     struct wcc_server *s = calloc(1, sizeof(*s));
     if (shot_path) {
         s->shot_path = shot_path;
-        fprintf(stderr, "WuBuCompositor: --screenshot %s (self-capture after boot)\n",
-                shot_path);
+        s->shot_delay_ms = shot_delay > 0 ? shot_delay : 0;
+        s->shot_start_ms = now_ms();
+        fprintf(stderr,
+                "WuBuCompositor: --screenshot %s delay=%d ms (self-capture)\n",
+                shot_path, s->shot_delay_ms);
     }
     if (!s) return 1;
 
