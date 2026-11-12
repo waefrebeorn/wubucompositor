@@ -37,10 +37,16 @@
 
 #include <X11/Xlib.h>
 #include <X11/cursorfont.h>
+#include <X11/extensions/XShm.h>
 #include <xkbcommon/xkbcommon.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 
-#define WC_OUTPUT_W 1024
-#define WC_OUTPUT_H 768
+/* Output size.  Defaults; main() overwrites them with the X screen size so
+ * the compositor fills the panel -- this is the product surface, not a
+ * developer window. */
+static int WC_OUTPUT_W = 1024;
+static int WC_OUTPUT_H = 768;
 #define BTN_LEFT 0x110
 #define BTN_MIDDLE 0x112
 #define BTN_RIGHT 0x111
@@ -84,6 +90,8 @@ struct wcc_server {
     int xd_focused;
     XImage *ximg;
     unsigned char *ximg_owner;
+    XShmSegmentInfo shm;
+    bool shm_ok;
     /* self-screenshot: --screenshot PATH captures the window as PPM after
      * the desktop's first commits, then exits 0 (headless-safe verify). */
     const char *shot_path;
@@ -98,8 +106,44 @@ struct wcc_server {
         struct wl_resource *pointer_res, *keyboard_res;
         struct wcc_surface *focused;
         double px, py;
+        uint32_t mods_depressed;   /* xkb modifier mask (wl_keyboard.modifiers) */
+        uint32_t mods_locked;      /* caps lock */
     } seat;
 };
+
+/* xkb modifier mask bits, matching wl_keyboard.modifiers. */
+#define WCC_MOD_SHIFT   (1u << 0)
+#define WCC_MOD_LOCK    (1u << 1)
+#define WCC_MOD_CTRL    (1u << 2)
+#define WCC_MOD_ALT     (1u << 3)
+#define WCC_MOD_NUM     (1u << 4)
+#define WCC_MOD_MOD3    (1u << 5)
+#define WCC_MOD_SUPER   (1u << 6)
+#define WCC_MOD_MOD5    (1u << 7)
+
+/* Track a held modifier key (X keycodes) so wl_keyboard.modifiers reflects
+ * the real state -- the client relies on it for shortcuts and text. */
+static void seat_mod_key(struct wcc_server *s, uint32_t keycode, bool down)
+{
+    uint32_t bit = 0;
+    switch (keycode) {
+    case 50:  case 62:  bit = WCC_MOD_SHIFT; break;  /* Shift_L / Shift_R */
+    case 37:  case 105: bit = WCC_MOD_CTRL;  break;  /* Control_L / Control_R */
+    case 64:  case 108: bit = WCC_MOD_ALT;   break;  /* Alt_L / Alt_R */
+    case 133: case 134: bit = WCC_MOD_SUPER; break;  /* Super_L / Super_R */
+    default: return;
+    }
+    if (down) s->seat.mods_depressed |=  bit;
+    else      s->seat.mods_depressed &= ~bit;
+}
+
+static void seat_send_modifiers(struct wcc_server *s)
+{
+    if (!s->seat.keyboard_res) return;
+    wl_keyboard_send_modifiers(s->seat.keyboard_res, next_serial(),
+                               s->seat.mods_depressed, s->seat.mods_locked,
+                               0 /* latched */, 0 /* group */);
+}
 
 /* =================== wl_compositor / wl_surface ========================= */
 
@@ -135,29 +179,36 @@ static void surface_set_input(struct wl_client *c, struct wl_resource *r,
 
 static void blit(struct wcc_server *s, struct wcc_surface *surf)
 {
-    if (!surf->buf || !s->xw) return;
+    if (!surf->buf || !s->xw || !s->ximg) return;
     void *data = wl_shm_buffer_get_data(surf->buf);
     int w = wl_shm_buffer_get_width(surf->buf);
     int h = wl_shm_buffer_get_height(surf->buf);
     int stride = wl_shm_buffer_get_stride(surf->buf);
-    size_t len = (size_t)w * h * 4;
+    if (w <= 0 || h <= 0 || stride < w * 4) return;
+    /* The client renders at the output size; anything else is a stale buffer
+     * from before a resize and must not be blitted. */
+    if (w != s->ximg->width || h != s->ximg->height) return;
+    size_t len = (size_t)stride * (size_t)h;
+    char *dst = (char *)s->ximg->data;
 
     /* Present-on-change: if the buffer is byte-identical to what we last
-     * showed, skip the XPutImage -- a repaint of an unchanged surface is
-     * what reads as flashing on the panel. Copy into our own backing
-     * store first so we never hand the X server a pointer into the
-     * client's shared pool (which it may reuse once released). */
-    if (memcmp(data, s->ximg_owner, len) == 0)
+     * showed, skip the put -- a repaint of an unchanged surface is what
+     * reads as flashing on the panel.  The XImage backing store IS our
+     * last-shown copy, so the compare is free. */
+    if (memcmp(data, dst, len) == 0)
         return;
-    memcpy(s->ximg_owner, data, len);
+    memcpy(dst, data, len);
 
-    s->ximg->width = w;
-    s->ximg->height = h;
-    s->ximg->bytes_per_line = stride;
-    s->ximg->data = (char *)s->ximg_owner;
-    XPutImage(s->xd, s->xw, DefaultGC(s->xd, 0), s->ximg,
-              0, 0, 0, 0, w, h);
-    XSync(s->xd, False);
+    if (s->shm_ok)
+        XShmPutImage(s->xd, s->xw, DefaultGC(s->xd, 0), s->ximg,
+                     0, 0, 0, 0, w, h, False);
+    else
+        XPutImage(s->xd, s->xw, DefaultGC(s->xd, 0), s->ximg,
+                  0, 0, 0, 0, w, h);
+    /* Flush, do not sync: XSync blocks the compositor until the X server
+     * has processed every request, which serialises the frame and adds a
+     * round trip of input latency to every repaint. */
+    XFlush(s->xd);
 }
 
 static void wcc_capture_screenshot(struct wcc_server *s, int w, int h)
@@ -335,6 +386,14 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r,
             if (s->app)
                 wl_keyboard_send_enter(s->seat.keyboard_res, next_serial(),
                                        s->app->resource, &empty);
+            seat_send_modifiers(s);
+            if (s->app && s->seat.pointer_res) {
+                wl_pointer_send_enter(s->seat.pointer_res, next_serial(),
+                                      s->app->resource,
+                                      wl_fixed_from_double(s->seat.px),
+                                      wl_fixed_from_double(s->seat.py));
+                s->seat.focused = s->app;
+            }
             close(fd);
         }
     }
@@ -392,24 +451,24 @@ static void pos_destroy(struct wl_client *c, struct wl_resource *r)
 static void pos_ignore(struct wl_client *c, struct wl_resource *r,
                        int32_t a, int32_t b)
 { (void)c;(void)r;(void)a;(void)b; }
+static void pos_ignore_rect(struct wl_client *c, struct wl_resource *r,
+                            int32_t a, int32_t b, int32_t d, int32_t e)
+{ (void)c;(void)r;(void)a;(void)b;(void)d;(void)e; }
 static void pos_ignore_uint(struct wl_client *c, struct wl_resource *r,
                             uint32_t a)
 { (void)c;(void)r;(void)a; }
-static void pos_ignore_uint2(struct wl_client *c, struct wl_resource *r,
-                             struct wl_resource *a, uint32_t b)
-{ (void)c;(void)r;(void)a;(void)b; }
 static void pos_set_reactive(struct wl_client *c, struct wl_resource *r)
 { (void)c;(void)r; }
 static const struct xdg_positioner_interface positioner_impl = {
     .destroy = pos_destroy,
     .set_size = pos_ignore,
-    .set_anchor_rect = pos_ignore,
+    .set_anchor_rect = pos_ignore_rect,
     .set_anchor = pos_ignore_uint,
     .set_gravity = pos_ignore_uint,
     .set_constraint_adjustment = pos_ignore_uint,
     .set_offset = pos_ignore,
     .set_reactive = pos_set_reactive,
-    .set_parent_size = pos_ignore_uint2,
+    .set_parent_size = pos_ignore,
     .set_parent_configure = pos_ignore_uint,
 };
 static void wm_create_positioner(struct wl_client *c, struct wl_resource *r,
@@ -587,11 +646,14 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
             if (s->app && s->seat.pointer_res) {
                 if (s->seat.focused != s->app) {
                     wl_pointer_send_enter(s->seat.pointer_res, next_serial(),
-                                          s->app->resource, s->seat.px, s->seat.py);
+                                          s->app->resource,
+                                          wl_fixed_from_double(s->seat.px),
+                                          wl_fixed_from_double(s->seat.py));
                     s->seat.focused = s->app;
                 }
                 wl_pointer_send_motion(s->seat.pointer_res, now_ms(),
-                                       s->seat.px, s->seat.py);
+                                       wl_fixed_from_double(s->seat.px),
+                                       wl_fixed_from_double(s->seat.py));
                 wl_pointer_send_frame(s->seat.pointer_res);
             }
             break;
@@ -605,6 +667,15 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
             default: continue;
             }
             if (s->seat.pointer_res) {
+                /* A click with no prior motion must still carry the pointer
+                 * position, or the client sees the press at (0,0). */
+                if (s->seat.focused != s->app && s->app) {
+                    wl_pointer_send_enter(s->seat.pointer_res, next_serial(),
+                                          s->app->resource,
+                                          wl_fixed_from_double(s->seat.px),
+                                          wl_fixed_from_double(s->seat.py));
+                    s->seat.focused = s->app;
+                }
                 wl_pointer_send_button(s->seat.pointer_res, next_serial(),
                                        now_ms(), btn, down ?
                                        WL_POINTER_BUTTON_STATE_PRESSED :
@@ -614,14 +685,27 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
             break;
         }
         case KeyPress:
-        case KeyRelease:
+        case KeyRelease: {
+            bool down = ev.type == KeyPress;
+            seat_mod_key(s, ev.xkey.keycode, down);
             if (s->seat.keyboard_res && s->app) {
                 wl_keyboard_send_key(s->seat.keyboard_res, next_serial(),
                                      now_ms(),
                                      ev.xkey.keycode > 8 ? ev.xkey.keycode - 8 : 0,
-                                     ev.type == KeyPress ?
+                                     down ?
                                      WL_KEYBOARD_KEY_STATE_PRESSED :
                                      WL_KEYBOARD_KEY_STATE_RELEASED);
+                /* Modifiers follow the key so the client's view of the
+                 * keyboard state is never stale. */
+                seat_send_modifiers(s);
+            }
+            break;
+        }
+        case LeaveNotify:
+            if (s->seat.pointer_res && s->seat.focused) {
+                wl_pointer_send_leave(s->seat.pointer_res, next_serial(),
+                                      s->seat.focused->resource);
+                s->seat.focused = NULL;
             }
             break;
         case Expose:
@@ -630,6 +714,12 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
                 s->xd_focused = 1;
                 XRaiseWindow(s->xd, s->xw);
                 XSetInputFocus(s->xd, s->xw, RevertToParent, CurrentTime);
+                /* Take the keyboard as well.  A host window manager installs
+                 * a passive grab on the Super press, so without this the
+                 * compositor never sees Win+W / Win+Z / Win+L -- only the
+                 * release arrives. */
+                XGrabKeyboard(s->xd, s->xw, True, GrabModeAsync,
+                              GrabModeAsync, CurrentTime);
             }
             break;
         default:
@@ -663,26 +753,65 @@ int main(int argc, char **argv)
     /* X errors (e.g. a transient BadMatch) must never kill the compositor. */
     XSetErrorHandler(wcc_x_error);
 
-    /* --- X output window --- */
+    /* --- X output window: fullscreen, override-redirect (no WM chrome) --- */
     s->xd = XOpenDisplay(NULL);
     if (!s->xd) { fprintf(stderr, "WuBuCompositor: no X display\n"); return 1; }
     int scr = DefaultScreen(s->xd);
-    s->xw = XCreateSimpleWindow(s->xd, RootWindow(s->xd, scr),
-                                30, 30, WC_OUTPUT_W, WC_OUTPUT_H, 1,
-                                BlackPixel(s->xd, scr), BlackPixel(s->xd, scr));
-    XSelectInput(s->xd, s->xw, ExposureMask | KeyPressMask | KeyReleaseMask |
-                 ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
+    WC_OUTPUT_W = WidthOfScreen(ScreenOfDisplay(s->xd, scr));
+    WC_OUTPUT_H = HeightOfScreen(ScreenOfDisplay(s->xd, scr));
+
+    XSetWindowAttributes swa = { 0 };
+    swa.override_redirect = True;
+    swa.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask |
+                     ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
+                     LeaveWindowMask | EnterWindowMask;
+    s->xw = XCreateWindow(s->xd, RootWindow(s->xd, scr), 0, 0,
+                          WC_OUTPUT_W, WC_OUTPUT_H, 0,
+                          CopyFromParent, InputOutput, CopyFromParent,
+                          CWOverrideRedirect | CWEventMask, &swa);
     XMapWindow(s->xd, s->xw);
+    XStoreName(s->xd, s->xw, "WuBuCompositor");
     XDefineCursor(s->xd, s->xw, XCreateFontCursor(s->xd, XC_left_ptr));
     /* Focus is taken once the window is viewable (first Expose); setting it
      * here, right after the async map, raises BadMatch (window not yet
      * viewable) which Xlib's default handler made fatal. */
     XFlush(s->xd);
 
-    s->ximg_owner = calloc((size_t)WC_OUTPUT_W * WC_OUTPUT_H * 4, 1);
-    s->ximg = XCreateImage(s->xd, DefaultVisual(s->xd, scr), 24, ZPixmap, 0,
-                           (char *)s->ximg_owner,
-                           WC_OUTPUT_W, WC_OUTPUT_H, 32, WC_OUTPUT_W * 4);
+    /* Shm blit path: one copy into our own segment, then a zero-copy put.
+     * Falls back to a malloc XImage when MIT-SHM is unavailable. */
+    if (XShmQueryExtension(s->xd)) {
+        s->ximg = XShmCreateImage(s->xd, DefaultVisual(s->xd, scr),
+                                  DefaultDepth(s->xd, scr), ZPixmap, NULL,
+                                  &s->shm, WC_OUTPUT_W, WC_OUTPUT_H);
+        if (s->ximg) {
+            s->shm.shmid = shmget(IPC_PRIVATE,
+                                  s->ximg->bytes_per_line * s->ximg->height,
+                                  IPC_CREAT | 0777);
+            if (s->shm.shmid >= 0) {
+                s->shm.shmaddr = (char *)shmat(s->shm.shmid, NULL, 0);
+                if (s->shm.shmaddr != (char *)-1) {
+                    s->ximg->data = s->shm.shmaddr;
+                    s->shm.readOnly = False;
+                    if (XShmAttach(s->xd, &s->shm)) {
+                        s->shm_ok = true;
+                    } else {
+                        shmdt(s->shm.shmaddr);
+                        shmctl(s->shm.shmid, IPC_RMID, NULL);
+                    }
+                } else {
+                    shmctl(s->shm.shmid, IPC_RMID, NULL);
+                }
+            }
+        }
+    }
+    if (!s->shm_ok) {
+        s->ximg_owner = calloc((size_t)WC_OUTPUT_W * WC_OUTPUT_H * 4, 1);
+        s->ximg = XCreateImage(s->xd, DefaultVisual(s->xd, scr),
+                               DefaultDepth(s->xd, scr), ZPixmap, 0,
+                               (char *)s->ximg_owner,
+                               WC_OUTPUT_W, WC_OUTPUT_H, 32, WC_OUTPUT_W * 4);
+    }
+    if (!s->ximg) { fprintf(stderr, "WuBuCompositor: no XImage\n"); return 1; }
     s->xfd = ConnectionNumber(s->xd);
 
     /* --- keymap for the client (US evdev, resolved client-side) --- */
