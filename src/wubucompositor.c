@@ -395,6 +395,43 @@ static void compositor_create_region(struct wl_client *c,
     wl_resource_set_implementation(reg, &region_impl, NULL, NULL);
 }
 
+/* Clear cached resources when the client destroys them.  Without these the
+ * seat/output globals keep pointing at freed resources after a disconnect,
+ * and the next event dereferences a NULL interface pointer -- observed as a
+ * hard segfault (NULL+0x53) inside libwayland-server.  The surface objects
+ * themselves are intentionally not freed here: the xdg resources share the
+ * same user_data and destruction order is not guaranteed. */
+static void wcc_resource_destroy(struct wl_resource *r)
+{
+    struct wcc_server *s = (struct wcc_server *)wl_resource_get_user_data(r);
+    if (!s) return;
+    if (s->seat.keyboard_res == r) s->seat.keyboard_res = NULL;
+    if (s->seat.pointer_res   == r) s->seat.pointer_res   = NULL;
+    if (s->seat_res           == r) s->seat_res           = NULL;
+    if (s->output_res         == r) s->output_res         = NULL;
+    if (s->wm_res             == r) s->wm_res             = NULL;
+    if (s->compositor_res     == r) s->compositor_res     = NULL;
+}
+
+static void wcc_surface_destroy(struct wl_resource *r)
+{
+    struct wcc_surface *surf = (struct wcc_surface *)wl_resource_get_user_data(r);
+    if (!surf || surf->resource != r) return;
+    surf->resource  = NULL;
+    surf->configured = false;
+    surf->buf        = NULL;
+    surf->pending_buffer = NULL;
+    if (surf->server && surf->server->app == surf)
+        surf->server->app = NULL;   /* the client's surface is gone */
+}
+
+static void wcc_xdg_destroy(struct wl_resource *r)
+{
+    struct wcc_surface *surf = (struct wcc_surface *)wl_resource_get_user_data(r);
+    if (!surf) return;
+    if (surf->toplevel == r) surf->toplevel = NULL;
+}
+
 static void compositor_create_surface(struct wl_client *c,
                                       struct wl_resource *r, uint32_t id)
 {
@@ -404,7 +441,8 @@ static void compositor_create_surface(struct wl_client *c,
     surf->server = s;
     surf->resource = wl_resource_create(c, &wl_surface_interface,
                                         wl_resource_get_version(r), id);
-    wl_resource_set_implementation(surf->resource, &surface_impl, surf, NULL);
+    wl_resource_set_implementation(surf->resource, &surface_impl, surf,
+                                   wcc_surface_destroy);
     if (!s->app) s->app = surf;
 }
 
@@ -418,7 +456,8 @@ static void compositor_bind(struct wl_client *c, void *data,
     struct wcc_server *s = data;
     s->compositor_res = wl_resource_create(c, &wl_compositor_interface,
                                            version, id);
-    wl_resource_set_implementation(s->compositor_res, &compositor_impl, s, NULL);
+    wl_resource_set_implementation(s->compositor_res, &compositor_impl, s,
+                                   wcc_resource_destroy);
 }
 
 /* =============================== wl_seat ================================ */
@@ -447,7 +486,8 @@ static void seat_get_pointer(struct wl_client *c, struct wl_resource *r,
     struct wcc_server *s = wl_resource_get_user_data(r);
     s->seat.pointer_res = wl_resource_create(c, &wl_pointer_interface,
                                              wl_resource_get_version(r), id);
-    wl_resource_set_implementation(s->seat.pointer_res, &pointer_impl, s, NULL);
+    wl_resource_set_implementation(s->seat.pointer_res, &pointer_impl, s,
+                                   wcc_resource_destroy);
 }
 static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r,
                               uint32_t id)
@@ -455,7 +495,8 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r,
     struct wcc_server *s = wl_resource_get_user_data(r);
     s->seat.keyboard_res = wl_resource_create(c, &wl_keyboard_interface,
                                               wl_resource_get_version(r), id);
-    wl_resource_set_implementation(s->seat.keyboard_res, &keyboard_impl, s, NULL);
+    wl_resource_set_implementation(s->seat.keyboard_res, &keyboard_impl, s,
+                                   wcc_resource_destroy);
 
     if (s->xkb_keymap_str) {
         size_t len = strlen(s->xkb_keymap_str);
@@ -507,7 +548,8 @@ static void seat_bind(struct wl_client *c, void *data,
 {
     struct wcc_server *s = data;
     s->seat_res = wl_resource_create(c, &wl_seat_interface, version, id);
-    wl_resource_set_implementation(s->seat_res, &seat_impl, s, NULL);
+    wl_resource_set_implementation(s->seat_res, &seat_impl, s,
+                                   wcc_resource_destroy);
     wl_seat_send_capabilities(s->seat_res,
                               WL_SEAT_CAPABILITY_POINTER |
                               WL_SEAT_CAPABILITY_KEYBOARD);
@@ -522,7 +564,8 @@ static void output_bind(struct wl_client *c, void *data,
     struct wcc_server *s = data;
     int v = version > 2 ? 2 : version;
     s->output_res = wl_resource_create(c, &wl_output_interface, v, id);
-    wl_resource_set_implementation(s->output_res, &output_impl, NULL, NULL);
+    wl_resource_set_implementation(s->output_res, &output_impl, NULL,
+                                   wcc_resource_destroy);
     wl_output_send_geometry(s->output_res, 0, 0, 0, 0,
                             WL_OUTPUT_SUBPIXEL_UNKNOWN, "", "",
                             WL_OUTPUT_TRANSFORM_NORMAL);
@@ -580,7 +623,8 @@ static void wm_get_xdg_surface(struct wl_client *c, struct wl_resource *r,
 
     struct wl_resource *res = wl_resource_create(c, &xdg_surface_interface,
                                                  wl_resource_get_version(r), id);
-    wl_resource_set_implementation(res, &xdg_surface_impl, surf, NULL);
+    wl_resource_set_implementation(res, &xdg_surface_impl, surf,
+                                   wcc_xdg_destroy);
     /* First configure: the client acks then may attach a buffer. */
     surf->toplevel = NULL;   /* cleared until get_toplevel */
     (void)s;
@@ -597,7 +641,8 @@ static void wm_bind(struct wl_client *c, void *data,
 {
     struct wcc_server *s = data;
     s->wm_res = wl_resource_create(c, &xdg_wm_base_interface, version, id);
-    wl_resource_set_implementation(s->wm_res, &wm_impl, s, NULL);
+    wl_resource_set_implementation(s->wm_res, &wm_impl, s,
+                                   wcc_resource_destroy);
     xdg_wm_base_send_ping(s->wm_res, next_serial());
 }
 
@@ -611,7 +656,8 @@ static void xdg_surface_get_toplevel(struct wl_client *c,
     struct wcc_surface *surf = wl_resource_get_user_data(r);
     surf->toplevel = wl_resource_create(c, &xdg_toplevel_interface,
                                         wl_resource_get_version(r), id);
-    wl_resource_set_implementation(surf->toplevel, &xdg_toplevel_impl, surf, NULL);
+    wl_resource_set_implementation(surf->toplevel, &xdg_toplevel_impl, surf,
+                                   wcc_xdg_destroy);
     /* configure: fullscreen-sized, empty states; the client acks the
      * corresponding xdg_surface.configure, enabling attach */
     struct wl_array states = { 0 };
