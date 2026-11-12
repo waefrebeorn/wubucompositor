@@ -280,6 +280,9 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r,
             wl_keyboard_send_keymap(s->seat.keyboard_res,
                                     WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd,
                                     (uint32_t)len);
+            /* Autorepeat: the client generates repeats from this info
+             * (both fields since wl_keyboard v1). 25 rate = 40 ms repeat. */
+            wl_keyboard_send_repeat_info(s->seat.keyboard_res, 25, 600);
             struct wl_array empty = { 0 };
             if (s->app)
                 wl_keyboard_send_enter(s->seat.keyboard_res, next_serial(),
