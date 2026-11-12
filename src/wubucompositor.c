@@ -81,6 +81,7 @@ struct wcc_server {
 
     Display *xd; Window xw;
     int xfd;
+    int xd_focused;
     XImage *ximg;
     unsigned char *ximg_owner;
 
@@ -512,6 +513,14 @@ static const struct xdg_toplevel_interface xdg_toplevel_impl = {
 
 /* ==================== X11 backend: input dispatch ======================= */
 
+static int wcc_x_error(Display *d, XErrorEvent *e)
+{
+    char buf[128];
+    XGetErrorText(d, e->error_code, buf, sizeof(buf));
+    fprintf(stderr, "[wcc] X error (req %d): %s\n", e->request_code, buf);
+    return 0;   /* recover; never abort the compositor on an X error */
+}
+
 static int x11_dispatch(int fd, uint32_t mask, void *data)
 {
     struct wcc_server *s = data;
@@ -564,6 +573,14 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
                                      WL_KEYBOARD_KEY_STATE_RELEASED);
             }
             break;
+        case Expose:
+            if (s->app && s->app->buf) blit(s, s->app);
+            if (!s->xd_focused) {
+                s->xd_focused = 1;
+                XRaiseWindow(s->xd, s->xw);
+                XSetInputFocus(s->xd, s->xw, RevertToParent, CurrentTime);
+            }
+            break;
         default:
             break;
         }
@@ -571,14 +588,15 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
     return 0;
 }
 
-/* ============================== main ==================================== */
-
 int main(int argc, char **argv)
 {
     (void)argc; (void)argv;
 
     struct wcc_server *s = calloc(1, sizeof(*s));
     if (!s) return 1;
+
+    /* X errors (e.g. a transient BadMatch) must never kill the compositor. */
+    XSetErrorHandler(wcc_x_error);
 
     /* --- X output window --- */
     s->xd = XOpenDisplay(NULL);
@@ -591,11 +609,9 @@ int main(int argc, char **argv)
                  ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
     XMapWindow(s->xd, s->xw);
     XDefineCursor(s->xd, s->xw, XCreateFontCursor(s->xd, XC_left_ptr));
-    /* The window must hold keyboard focus or no key events reach it:
-     * pointer motion needs no focus, keys do. Raise and grab focus so
-     * typing reaches the client. */
-    XRaiseWindow(s->xd, s->xw);
-    XSetInputFocus(s->xd, s->xw, RevertToParent, CurrentTime);
+    /* Focus is taken once the window is viewable (first Expose); setting it
+     * here, right after the async map, raises BadMatch (window not yet
+     * viewable) which Xlib's default handler made fatal. */
     XFlush(s->xd);
 
     s->ximg_owner = calloc((size_t)WC_OUTPUT_W * WC_OUTPUT_H * 4, 1);
