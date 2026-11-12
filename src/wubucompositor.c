@@ -38,6 +38,8 @@
 #include <X11/Xlib.h>
 #include <X11/cursorfont.h>
 #include <X11/extensions/XShm.h>
+#include <GL/gl.h>
+#include <GL/glx.h>
 #include <xkbcommon/xkbcommon.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -92,6 +94,18 @@ struct wcc_server {
     unsigned char *ximg_owner;
     XShmSegmentInfo shm;
     bool shm_ok;
+
+    /* GPU present (GLX).  When ok, the client's buffer is uploaded to a
+     * texture and drawn by the GPU; the XShm path becomes the fallback. */
+    struct {
+        bool ok;
+        XVisualInfo *vi;
+        Visual *visual;
+        int depth;
+        GLXContext ctx;
+        GLuint tex;
+        unsigned char *last;   /* last presented frame, for change detect */
+    } gpu;
     /* self-screenshot: --screenshot PATH captures the window as PPM after
      * the desktop's first commits, then exits 0 (headless-safe verify). */
     const char *shot_path;
@@ -177,9 +191,73 @@ static void surface_set_input(struct wl_client *c, struct wl_resource *r,
                               struct wl_resource *region)
 { (void)c;(void)r;(void)region; }
 
+/* --- GPU present --------------------------------------------------- */
+/* The client renders 0x00RRGGBB into its shm buffer; in memory that is the
+ * byte order B,G,R,00, which is exactly GL_BGRA.  Blending stays off, so the
+ * unused alpha byte never reaches the panel. */
+
+static void gpu_destroy(struct wcc_server *s)
+{
+    if (!s->gpu.ok) return;
+    glXMakeCurrent(s->xd, None, NULL);
+    if (s->gpu.ctx) glXDestroyContext(s->xd, s->gpu.ctx);
+    if (s->gpu.tex) glDeleteTextures(1, &s->gpu.tex);
+    free(s->gpu.last);
+    if (s->gpu.vi) XFree(s->gpu.vi);
+    memset(&s->gpu, 0, sizeof s->gpu);
+}
+
+static void gpu_setup(struct wcc_server *s)
+{
+    const int w = WC_OUTPUT_W, h = WC_OUTPUT_H;
+    glViewport(0, 0, w, h);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    glOrtho(0, w, h, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+
+    glGenTextures(1, &s->gpu.tex);
+    glBindTexture(GL_TEXTURE_2D, s->gpu.tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_BGRA,
+                 GL_UNSIGNED_BYTE, NULL);
+
+    s->gpu.last = calloc((size_t)w * h * 4, 1);
+    if (!s->gpu.last) { gpu_destroy(s); return; }
+    s->gpu.ok = true;
+}
+
+static void gpu_present(struct wcc_server *s, const void *data,
+                        int w, int h, int stride)
+{
+    if (!s->gpu.ok) return;
+    glBindTexture(GL_TEXTURE_2D, s->gpu.tex);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGRA,
+                    GL_UNSIGNED_BYTE, data);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+
+    glEnable(GL_TEXTURE_2D);
+    glColor4f(1.f, 1.f, 1.f, 1.f);
+    glBegin(GL_QUADS);
+        glTexCoord2f(0.f, 0.f); glVertex2f(0.f, 0.f);
+        glTexCoord2f(1.f, 0.f); glVertex2f((GLfloat)w, 0.f);
+        glTexCoord2f(1.f, 1.f); glVertex2f((GLfloat)w, (GLfloat)h);
+        glTexCoord2f(0.f, 1.f); glVertex2f(0.f, (GLfloat)h);
+    glEnd();
+    glDisable(GL_TEXTURE_2D);
+    glXSwapBuffers(s->xd, s->xw);
+}
+
 static void blit(struct wcc_server *s, struct wcc_surface *surf)
 {
-    if (!surf->buf || !s->xw || !s->ximg) return;
+    if (!surf->buf || !s->xw) return;
     void *data = wl_shm_buffer_get_data(surf->buf);
     int w = wl_shm_buffer_get_width(surf->buf);
     int h = wl_shm_buffer_get_height(surf->buf);
@@ -187,8 +265,21 @@ static void blit(struct wcc_server *s, struct wcc_surface *surf)
     if (w <= 0 || h <= 0 || stride < w * 4) return;
     /* The client renders at the output size; anything else is a stale buffer
      * from before a resize and must not be blitted. */
-    if (w != s->ximg->width || h != s->ximg->height) return;
+    if (w != WC_OUTPUT_W || h != WC_OUTPUT_H) return;
     size_t len = (size_t)stride * (size_t)h;
+
+    /* GPU path: the last presented frame is our change detector, so an
+     * unchanged surface costs one memcmp and no upload. */
+    if (s->gpu.ok) {
+        if (memcmp(data, s->gpu.last, len) == 0)
+            return;
+        memcpy(s->gpu.last, data, len);
+        gpu_present(s, data, w, h, stride);
+        return;
+    }
+
+    if (!s->ximg) return;
+    if (w != s->ximg->width || h != s->ximg->height) return;
     char *dst = (char *)s->ximg->data;
 
     /* Present-on-change: if the buffer is byte-identical to what we last
@@ -765,10 +856,33 @@ int main(int argc, char **argv)
     swa.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask |
                      ButtonPressMask | ButtonReleaseMask | PointerMotionMask |
                      LeaveWindowMask | EnterWindowMask;
+
+    /* --- GPU present: pick a GLX-capable visual for the output window.
+     * Without this the window keeps CopyFromParent and glXMakeCurrent on it
+     * fails, which would silently drop us back to the CPU blit. --- */
+    int gl_attribs[] = {
+        GLX_RGBA, True,
+        GLX_RED_SIZE, 8, GLX_GREEN_SIZE, 8, GLX_BLUE_SIZE, 8,
+        GLX_DOUBLEBUFFER, True,
+        None
+    };
+    s->gpu.vi = glXChooseVisual(s->xd, scr, gl_attribs);
+    if (s->gpu.vi) {
+        s->gpu.visual = s->gpu.vi->visual;
+        s->gpu.depth  = s->gpu.vi->depth;
+    }
+    unsigned long swa_mask = CWOverrideRedirect | CWEventMask;
+    if (s->gpu.visual) {
+        swa.colormap = XCreateColormap(s->xd, RootWindow(s->xd, scr),
+                                      s->gpu.visual, AllocNone);
+        swa_mask |= CWColormap;
+    }
     s->xw = XCreateWindow(s->xd, RootWindow(s->xd, scr), 0, 0,
                           WC_OUTPUT_W, WC_OUTPUT_H, 0,
-                          CopyFromParent, InputOutput, CopyFromParent,
-                          CWOverrideRedirect | CWEventMask, &swa);
+                          s->gpu.depth ? s->gpu.depth : CopyFromParent,
+                          InputOutput,
+                          s->gpu.visual ? s->gpu.visual : CopyFromParent,
+                          swa_mask, &swa);
     XMapWindow(s->xd, s->xw);
     XStoreName(s->xd, s->xw, "WuBuCompositor");
     XDefineCursor(s->xd, s->xw, XCreateFontCursor(s->xd, XC_left_ptr));
@@ -777,8 +891,23 @@ int main(int argc, char **argv)
      * viewable) which Xlib's default handler made fatal. */
     XFlush(s->xd);
 
+    /* --- GPU present: create the GLX context on the output window --- */
+    if (s->gpu.vi) {
+        s->gpu.ctx = glXCreateContext(s->xd, s->gpu.vi, NULL, True);
+        if (s->gpu.ctx && glXMakeCurrent(s->xd, s->xw, s->gpu.ctx)) {
+            gpu_setup(s);
+            fprintf(stderr, "WuBuCompositor: GPU present active (GLX)\n");
+        } else {
+            fprintf(stderr, "WuBuCompositor: GLX unavailable, CPU blit\n");
+            if (s->gpu.ctx) { glXDestroyContext(s->xd, s->gpu.ctx); s->gpu.ctx = NULL; }
+            XFree(s->gpu.vi); s->gpu.vi = NULL; s->gpu.visual = NULL;
+        }
+    }
+
     /* Shm blit path: one copy into our own segment, then a zero-copy put.
-     * Falls back to a malloc XImage when MIT-SHM is unavailable. */
+     * Only needed when the GPU present is unavailable; falls back to a malloc
+     * XImage when MIT-SHM is missing. */
+    if (!s->gpu.ok) {
     if (XShmQueryExtension(s->xd)) {
         s->ximg = XShmCreateImage(s->xd, DefaultVisual(s->xd, scr),
                                   DefaultDepth(s->xd, scr), ZPixmap, NULL,
@@ -812,6 +941,7 @@ int main(int argc, char **argv)
                                WC_OUTPUT_W, WC_OUTPUT_H, 32, WC_OUTPUT_W * 4);
     }
     if (!s->ximg) { fprintf(stderr, "WuBuCompositor: no XImage\n"); return 1; }
+    }
     s->xfd = ConnectionNumber(s->xd);
 
     /* --- keymap for the client (US evdev, resolved client-side) --- */

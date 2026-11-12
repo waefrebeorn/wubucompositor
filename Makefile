@@ -9,8 +9,8 @@
 CC      ?= gcc
 CFLAGS  ?= -O2
 CFLAGS  += -std=c11 -Wall -Wextra -Iprotocols -D_POSIX_C_SOURCE=200809L
-CFLAGS  += $(shell pkg-config --cflags wayland-server xkbcommon x11 xext)
-LIBS    := $(shell pkg-config --libs wayland-server xkbcommon x11 xext) -lm
+CFLAGS  += $(shell pkg-config --cflags wayland-server xkbcommon x11 xext glx)
+LIBS    := $(shell pkg-config --libs wayland-server xkbcommon x11 xext glx) -lm -lGL
 
 SRC := src/wubucompositor.c protocols/wayland-server-protocol.c \
        protocols/xdg-shell-server-protocol.c
