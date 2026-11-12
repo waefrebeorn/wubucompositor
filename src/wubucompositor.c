@@ -84,6 +84,11 @@ struct wcc_server {
     int xd_focused;
     XImage *ximg;
     unsigned char *ximg_owner;
+    /* self-screenshot: --screenshot PATH captures the window as PPM after
+     * the desktop's first commits, then exits 0 (headless-safe verify). */
+    const char *shot_path;
+    int shot_done;
+    int shot_commits;
 
     char *xkb_keymap_str;
 
@@ -153,6 +158,39 @@ static void blit(struct wcc_server *s, struct wcc_surface *surf)
     XSync(s->xd, False);
 }
 
+static void wcc_capture_screenshot(struct wcc_server *s, int w, int h)
+{
+    XImage *im = XGetImage(s->xd, s->xw, 0, 0, (unsigned)w, (unsigned)h,
+                           AllPlanes, ZPixmap);
+    if (!im) { fprintf(stderr, "[wcc] screenshot: XGetImage failed\n"); return; }
+    FILE *f = fopen(s->shot_path, "wb");
+    if (!f) { fprintf(stderr, "[wcc] screenshot: cannot open %s\n", s->shot_path); }
+    else {
+        fprintf(f, "P6\n%d %d\n255\n", w, h);
+        unsigned char *row = (unsigned char *)im->data;
+        int bpp = im->bits_per_pixel / 8;
+        for (int y = 0; y < h; y++) {
+            unsigned char *pix = row;
+            for (int x = 0; x < w; x++) {
+                unsigned v = (bpp >= 4) ? ((unsigned)pix[0]|((unsigned)pix[1]<<8)|
+                                           ((unsigned)pix[2]<<16)|((unsigned)pix[3]<<24))
+                                        : (unsigned)pix[0]|((unsigned)pix[1]<<8)|
+                                          ((unsigned)pix[2]<<16);
+                fputc((v>>16)&0xff, f);   /* R */
+                fputc((v>>8)&0xff, f);    /* G */
+                fputc(v&0xff, f);         /* B */
+                pix += bpp;
+            }
+            row += im->bytes_per_line;
+        }
+        fclose(f);
+        fprintf(stderr, "[wcc] screenshot: wrote %s (%dx%d)\n", s->shot_path, w, h);
+    }
+    XDestroyImage(im);
+    s->shot_done = 1;
+    wl_display_terminate(s->display);   /* exit cleanly after capture */
+}
+
 static void surface_commit(struct wl_client *c, struct wl_resource *r)
 {
     (void)c;
@@ -169,6 +207,9 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r)
         surf->buf = buf;
         blit(s, surf);
         wl_buffer_send_release(buf_res);
+        /* self-screenshot: after a few settled commits, capture and stop. */
+        if (s->shot_path && !s->shot_done && ++s->shot_commits >= 4)
+            wcc_capture_screenshot(s, WC_OUTPUT_W, WC_OUTPUT_H);
     }
     surf->pending_buffer = NULL;
     if (surf->frame_cb) { wl_callback_send_done(surf->frame_cb, now_ms());
@@ -593,9 +634,16 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
 
 int main(int argc, char **argv)
 {
-    (void)argc; (void)argv;
+    const char *shot_path = NULL;
+    for (int i = 1; i + 1 < argc; i++)
+        if (strcmp(argv[i], "--screenshot") == 0) shot_path = argv[i + 1];
 
     struct wcc_server *s = calloc(1, sizeof(*s));
+    if (shot_path) {
+        s->shot_path = shot_path;
+        fprintf(stderr, "WuBuCompositor: --screenshot %s (self-capture after boot)\n",
+                shot_path);
+    }
     if (!s) return 1;
 
     /* X errors (e.g. a transient BadMatch) must never kill the compositor. */
