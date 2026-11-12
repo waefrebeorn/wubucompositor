@@ -591,6 +591,11 @@ int main(int argc, char **argv)
                  ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
     XMapWindow(s->xd, s->xw);
     XDefineCursor(s->xd, s->xw, XCreateFontCursor(s->xd, XC_left_ptr));
+    /* The window must hold keyboard focus or no key events reach it:
+     * pointer motion needs no focus, keys do. Raise and grab focus so
+     * typing reaches the client. */
+    XRaiseWindow(s->xd, s->xw);
+    XSetInputFocus(s->xd, s->xw, RevertToParent, CurrentTime);
     XFlush(s->xd);
 
     s->ximg_owner = calloc((size_t)WC_OUTPUT_W * WC_OUTPUT_H * 4, 1);
