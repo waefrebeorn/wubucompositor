@@ -25,7 +25,11 @@ $(BIN): $(SRC)
 run: $(BIN)
 	./$(BIN)
 
+# Self-test: boot, capture, assert the PPM is a real desktop (not mono).
+test: $(BIN)
+	./wcc_test.sh
+
 clean:
 	rm -f $(BIN)
 
-.PHONY: all run clean
+.PHONY: all run test clean
