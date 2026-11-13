@@ -87,6 +87,13 @@ struct wcc_server {
     struct wl_resource *compositor_res, *seat_res, *output_res, *wm_res;
     struct wcc_surface *app;
 
+    /* This compositor drives exactly one desktop.  The owner is remembered so
+     * a second client is refused instead of silently sharing the seat -- two
+     * clients on one seat produced "object from one client used for another"
+     * errors and an undefined pointer/keyboard state. */
+    struct wl_client *client;
+    struct wl_listener client_destroy;
+
     Display *xd; Window xw;
     int xfd;
     int xd_focused;
@@ -450,10 +457,67 @@ static const struct wl_compositor_interface compositor_impl = {
     .create_surface = compositor_create_surface,
     .create_region = compositor_create_region,
 };
+/* -- Refusal ---------------------------------------------------------
+ * A second client gets these instead of the real implementations.  Every
+ * request is silently ignored, so the intruder cannot create a surface, bind a
+ * seat, or receive a single input event, and the owner is never disturbed. */
+static void refused_no_op(struct wl_client *c, struct wl_resource *r)
+{ (void)c; (void)r; }
+static void refused_create_surface(struct wl_client *c, struct wl_resource *r,
+                                   uint32_t id)
+{ (void)c; (void)r; (void)id; }
+static void refused_create_region(struct wl_client *c, struct wl_resource *r,
+                                  uint32_t id)
+{ (void)c; (void)r; (void)id; }
+static const struct wl_compositor_interface refused_compositor_impl = {
+    .create_surface = refused_create_surface,
+    .create_region  = refused_create_region,
+};
+
+/* True when `c` is the desktop that owns this output. */
+static bool wcc_is_owner(struct wcc_server *s, struct wl_client *c)
+{
+    return s->client != NULL && s->client == c;
+}
+
+/* Ownership must clear when the owning client goes away, or a perfectly good
+ * replacement would be refused for ever after one bad launch. */
+static void wcc_client_gone(struct wl_listener *listener, void *data)
+{
+    (void)data;
+    struct wcc_server *s = wl_container_of(listener, s, client_destroy);
+    s->client = NULL;
+    fprintf(stderr, "WuBuCompositor: the desktop client disconnected\n");
+}
+
 static void compositor_bind(struct wl_client *c, void *data,
                             uint32_t version, uint32_t id)
 {
     struct wcc_server *s = data;
+
+    if (s->client && s->client != c) {
+        /* Do NOT post an error and destroy the client here: tearing a client
+         * down inside its own bind callback walks libwayland's resource list
+         * while it is being mutated, and this compositor takes the segfault
+         * (observed at NULL+0x4 in libwayland-server).  Binding the global to
+         * a no-op implementation instead leaves the second client connected
+         * but completely inert -- it can draw nothing and receives no input,
+         * which is exactly the refusal we want, achieved without touching the
+         * owner's state. */
+        fprintf(stderr, "WuBuCompositor: refusing a second client "
+                        "(one desktop owns this output)\n");
+        struct wl_resource *res =
+            wl_resource_create(c, &wl_compositor_interface, version, id);
+        wl_resource_set_implementation(res, &refused_compositor_impl, s, NULL);
+        return;
+    }
+
+    if (!s->client) {
+        s->client = c;
+        s->client_destroy.notify = wcc_client_gone;
+        wl_client_add_destroy_listener(c, &s->client_destroy);
+    }
+
     s->compositor_res = wl_resource_create(c, &wl_compositor_interface,
                                            version, id);
     wl_resource_set_implementation(s->compositor_res, &compositor_impl, s,
@@ -484,6 +548,8 @@ static void seat_get_pointer(struct wl_client *c, struct wl_resource *r,
                              uint32_t id)
 {
     struct wcc_server *s = wl_resource_get_user_data(r);
+    if (!wcc_is_owner(s, c))
+        return;                 /* not the desktop: no pointer for you */
     s->seat.pointer_res = wl_resource_create(c, &wl_pointer_interface,
                                              wl_resource_get_version(r), id);
     wl_resource_set_implementation(s->seat.pointer_res, &pointer_impl, s,
@@ -493,6 +559,8 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r,
                               uint32_t id)
 {
     struct wcc_server *s = wl_resource_get_user_data(r);
+    if (!wcc_is_owner(s, c))
+        return;                 /* not the desktop: no keyboard for you */
     s->seat.keyboard_res = wl_resource_create(c, &wl_keyboard_interface,
                                               wl_resource_get_version(r), id);
     wl_resource_set_implementation(s->seat.keyboard_res, &keyboard_impl, s,
@@ -547,10 +615,21 @@ static void seat_bind(struct wl_client *c, void *data,
                       uint32_t version, uint32_t id)
 {
     struct wcc_server *s = data;
-    s->seat_res = wl_resource_create(c, &wl_seat_interface, version, id);
-    wl_resource_set_implementation(s->seat_res, &seat_impl, s,
-                                   wcc_resource_destroy);
-    wl_seat_send_capabilities(s->seat_res,
+    struct wl_resource *res =
+        wl_resource_create(c, &wl_seat_interface, version, id);
+
+    if (!wcc_is_owner(s, c)) {
+        /* Exists only so the bind completes.  It advertises no capabilities
+         * and must NOT take s->seat_res away from the desktop that owns the
+         * output -- overwriting it here was how the two clients ended up
+         * sharing one seat. */
+        wl_resource_set_implementation(res, &seat_impl, s, NULL);
+        return;
+    }
+
+    s->seat_res = res;
+    wl_resource_set_implementation(res, &seat_impl, s, wcc_resource_destroy);
+    wl_seat_send_capabilities(res,
                               WL_SEAT_CAPABILITY_POINTER |
                               WL_SEAT_CAPABILITY_KEYBOARD);
 }
@@ -1018,10 +1097,19 @@ int main(int argc, char **argv)
     if (!sock) return 1;
     setenv("WAYLAND_DISPLAY", sock, 1);
 
-    const char *start = getenv("WUBU_START_CMD");
-    if (!start || !*start) start = "/home/wubu/wubuos/src/hosted/wubu";
-    pid_t pid = fork();
-    if (pid == 0) { execl("/bin/sh", "sh", "-c", start, (char *)NULL); _exit(127); }
+    /* The guest is spawned here so `./wubucompositor` alone brings up the
+     * desktop.  WUBU_NO_SPAWN=1 skips that, which is what you want when you are
+     * starting the guest yourself -- spawning a second one only produced two
+     * clients fighting over one seat. */
+    const char *no_spawn = getenv("WUBU_NO_SPAWN");
+    if (!(no_spawn && *no_spawn && no_spawn[0] != '0')) {
+        const char *start = getenv("WUBU_START_CMD");
+        if (!start || !*start) start = "/home/wubu/wubuos/src/hosted/wubu";
+        pid_t pid = fork();
+        if (pid == 0) { execl("/bin/sh", "sh", "-c", start, (char *)NULL); _exit(127); }
+    } else {
+        fprintf(stderr, "WuBuCompositor: WUBU_NO_SPAWN set; waiting for a client\n");
+    }
 
     fprintf(stderr, "WuBuCompositor: socket=%s output=%dx%d\n",
             sock, WC_OUTPUT_W, WC_OUTPUT_H);
