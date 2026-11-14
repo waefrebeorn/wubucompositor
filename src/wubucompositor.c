@@ -83,10 +83,23 @@ struct wcc_surface {
 static const struct xdg_surface_interface xdg_surface_impl;
 static const struct xdg_toplevel_interface xdg_toplevel_impl;
 
+/* One per advertised display.  A wl_output is a GLOBAL: binding it must yield THAT
+ * output, not whichever one a single shared global happens to describe.  Each global
+ * therefore carries its own context naming the monitor it belongs to. */
+typedef struct {
+    struct wcc_server *server;
+    wcc_monitor_t     *monitor;
+} wcc_output_ctx;
+
 struct wcc_server {
     struct wl_display *display;
     struct wl_event_loop *loop;
-    struct wl_resource *compositor_res, *seat_res, *output_res, *wm_res;
+    struct wl_resource *compositor_res, *seat_res, *wm_res;
+    /* Per-client bound output resources, one per advertised monitor.  A single cached
+     * pointer could only ever track one of them; after a client disconnect the rest
+     * would dangle and the next event would dereference freed memory. */
+    struct wl_resource *output_res[WCC_MAX_MONITORS];
+    int                 n_output_res;
     struct wcc_surface *app;
 
     /* What is actually attached.  Replaces the previous single hardcoded output
@@ -94,6 +107,7 @@ struct wcc_server {
      * physical size and full mode list -- which is what resolution support needs:
      * a guest can only CHOOSE from modes it was told about. */
     wcc_monitors_t monitors;
+    wcc_output_ctx output_ctx[WCC_MAX_MONITORS];
 
     /* This compositor drives exactly one desktop.  The owner is remembered so
      * a second client is refused instead of silently sharing the seat -- two
@@ -423,7 +437,8 @@ static void wcc_resource_destroy(struct wl_resource *r)
     if (s->seat.keyboard_res == r) s->seat.keyboard_res = NULL;
     if (s->seat.pointer_res   == r) s->seat.pointer_res   = NULL;
     if (s->seat_res           == r) s->seat_res           = NULL;
-    if (s->output_res         == r) s->output_res         = NULL;
+    for (int i = 0; i < s->n_output_res; i++)
+        if (s->output_res[i] == r) { s->output_res[i] = NULL; break; }
     if (s->wm_res             == r) s->wm_res             = NULL;
     if (s->compositor_res     == r) s->compositor_res     = NULL;
 }
@@ -648,18 +663,19 @@ static const struct wl_output_interface output_impl = { .release = NULL };
 static void output_bind(struct wl_client *c, void *data,
                         uint32_t version, uint32_t id)
 {
-    struct wcc_server *s = data;
+    wcc_output_ctx *ctx = (wcc_output_ctx *)data;
+    if (!ctx || !ctx->server) return;
+    struct wcc_server *s = ctx->server;
+    const wcc_monitor_t *m = ctx->monitor;
+
     int v = version > 2 ? 2 : version;
-    s->output_res = wl_resource_create(c, &wl_output_interface, v, id);
-    wl_resource_set_implementation(s->output_res, &output_impl, NULL,
-                                   wcc_resource_destroy);
+    struct wl_resource *res = wl_resource_create(c, &wl_output_interface, v, id);
+    wl_resource_set_implementation(res, &output_impl, NULL, wcc_resource_destroy);
 
-    /* Prefer the REAL primary display.  Discovery can fail (no X server at all), and
-     * then we fall back to the compiled-in default rather than advertising nothing --
-     * but never to invented geometry that claims a monitor exists where none does. */
-    const wcc_monitor_t *m = (s->monitors.count > 0) ? &s->monitors.m[0] : NULL;
+    if (s->n_output_res < WCC_MAX_MONITORS)
+        s->output_res[s->n_output_res++] = res;
 
-    wl_output_send_geometry(s->output_res,
+    wl_output_send_geometry(res,
                             m ? m->x : 0, m ? m->y : 0,
                             m ? m->mm_w : 0, m ? m->mm_h : 0,
                             WL_OUTPUT_SUBPIXEL_UNKNOWN,
@@ -667,26 +683,24 @@ static void output_bind(struct wl_client *c, void *data,
                             WL_OUTPUT_TRANSFORM_NORMAL);
 
     if (m && m->nmodes > 0) {
-        /* Advertise EVERY mode, flagging the live one.  This is the difference between
-         * a resolution readout and resolution SUPPORT: with only the current mode a
-         * client has nothing to choose. */
+        /* Advertise EVERY mode, flagging the live one.  With only the current mode a
+         * client has nothing to CHOOSE -- that is a readout, not resolution support. */
         for (int i = 0; i < m->nmodes; i++) {
             uint32_t flags = 0;
             if (m->modes[i].current) flags |= WL_OUTPUT_MODE_CURRENT;
-            /* The first entry is XRandR's preferred mode. */
             if (i == 0) flags |= WL_OUTPUT_MODE_PREFERRED;
-            wl_output_send_mode(s->output_res, flags,
+            wl_output_send_mode(res, flags,
                                 m->modes[i].w, m->modes[i].h,
                                 m->modes[i].refresh_mhz * 1000);
         }
     } else {
-        wl_output_send_mode(s->output_res, WL_OUTPUT_MODE_CURRENT |
+        wl_output_send_mode(res, WL_OUTPUT_MODE_CURRENT |
                             WL_OUTPUT_MODE_PREFERRED,
                             WC_OUTPUT_W, WC_OUTPUT_H, 60000);
     }
 
-    if (v >= 2) wl_output_send_scale(s->output_res, 1);
-    if (v >= 3) wl_output_send_done(s->output_res);
+    if (v >= 2) wl_output_send_scale(res, 1);
+    if (v >= 3) wl_output_send_done(res);
 }
 
 /* ============================ xdg shell ================================= */
@@ -1134,7 +1148,25 @@ int main(int argc, char **argv)
                 s->monitors.m[0].refresh_mhz, s->monitors.m[0].nmodes);
     }
 
-    wl_global_create(s->display, &wl_output_interface, 2, s, output_bind);
+    /* One global PER DISPLAY.  A single shared global meant a client binding
+     * wl_output once received whichever monitor happened to be described by it --
+     * on a two-monitor host it could only ever see one. */
+    if (s->monitors.count <= 0) {
+        /* Headless / no X: advertise one default so clients still get an output. */
+        static wcc_monitor_t default_mon;
+        memset(&default_mon, 0, sizeof(default_mon));
+        s->output_ctx[0].server  = s;
+        s->output_ctx[0].monitor = &default_mon;
+        wl_global_create(s->display, &wl_output_interface, 2,
+                         &s->output_ctx[0], output_bind);
+    } else {
+        for (int i = 0; i < s->monitors.count; i++) {
+            s->output_ctx[i].server  = s;
+            s->output_ctx[i].monitor = &s->monitors.m[i];
+            wl_global_create(s->display, &wl_output_interface, 2,
+                             &s->output_ctx[i], output_bind);
+        }
+    }
     wl_global_create(s->display, &xdg_wm_base_interface, 1, s, wm_bind);
 
     wl_event_loop_add_fd(s->loop, s->xfd, WL_EVENT_READABLE, x11_dispatch, s);
