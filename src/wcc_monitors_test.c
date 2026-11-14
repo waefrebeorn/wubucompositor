@@ -122,6 +122,22 @@ int main(void)
             }
         }
 
+        /* The whole point of resolution support: more than one CHOICE, with the
+         * active one flagged so a menu can mark it. */
+        TEST(real.m[0].nmodes > 1,
+             "advertised monitor offers more than one resolution");
+        {
+            int current_count = 0;
+            bool sizes_ok = true;
+            for (int k = 0; k < real.m[0].nmodes; k++) {
+                if (real.m[0].modes[k].current) current_count++;
+                if (real.m[0].modes[k].w <= 0 || real.m[0].modes[k].h <= 0)
+                    sizes_ok = false;
+            }
+            TEST(current_count == 1, "exactly one advertised mode is current");
+            TEST(sizes_ok, "every advertised mode has a real size");
+        }
+
         /* Exactly one primary when any exist -- two primaries would leave every
          * taskbar/overview decision ambiguous. */
         int primaries = 0;

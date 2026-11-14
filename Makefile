@@ -12,7 +12,8 @@ CFLAGS  += -std=c11 -Wall -Wextra -Iprotocols -D_POSIX_C_SOURCE=200809L
 CFLAGS  += $(shell pkg-config --cflags wayland-server xkbcommon x11 xext glx) -I/usr/include/X11/extensions
 LIBS    := $(shell pkg-config --libs wayland-server xkbcommon x11 xext glx) -lm -lGL -lXrandr
 
-SRC := src/wubucompositor.c protocols/wayland-server-protocol.c \ src/wcc_monitors.c
+SRC := src/wubucompositor.c protocols/wayland-server-protocol.c \
+       src/wcc_monitors.c \
        protocols/xdg-shell-server-protocol.c
 BIN := wubucompositor
 

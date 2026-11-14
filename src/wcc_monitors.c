@@ -93,6 +93,38 @@ int wcc_monitors_discover(wcc_monitors_t *out)
                     }
                 }
 
+                /* Every mode this output offers, resolved from ids through the
+                 * screen's mode table.  Order is kept as XRandR presents it, which is
+                 * preferred-first -- the same order a resolution menu should show. */
+                for (int mi = 0; mi < oi->nmode && m->nmodes < WCC_MAX_MODES; mi++) {
+                    for (int k = 0; k < res->nmode; k++) {
+                        if (res->modes[k].id != (XID)oi->modes[mi]) continue;
+
+                        wcc_mode_t *mode = &m->modes[m->nmodes];
+                        mode->w          = (int)res->modes[k].width;
+                        mode->h          = (int)res->modes[k].height;
+                        mode->refresh_mhz =
+                            (int)(res->modes[k].dotClock * 1000.0 /
+                                  ((double)res->modes[k].hTotal *
+                                   (double)res->modes[k].vTotal));
+                        mode->current = (ci && ci->mode == res->modes[k].id);
+                        m->nmodes++;
+                        break;
+                    }
+                }
+
+                /* When no CRTC was visible we could not observe WHICH mode is live,
+                 * so nothing was flagged above.  The resolution we reported comes from
+                 * modes[0], so flagging that same entry keeps the descriptor honest --
+                 * a monitor with zero current modes tells a client "nothing is
+                 * running", which is false and leaves a menu with no marked choice. */
+                if (m->nmodes > 0) {
+                    bool any_current = false;
+                    for (int k = 0; k < m->nmodes; k++)
+                        if (m->modes[k].current) { any_current = true; break; }
+                    if (!any_current) m->modes[0].current = true;
+                }
+
                 m->primary   = (res->outputs[i] == primary_output);
                 m->connected = true;
                 n++;

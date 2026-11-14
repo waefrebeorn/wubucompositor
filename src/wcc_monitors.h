@@ -39,6 +39,14 @@
 #define WCC_MAX_MONITORS 8
 #define WCC_MONITOR_NAME 64
 
+#define WCC_MAX_MODES 32
+
+typedef struct {
+    int  w, h;
+    int  refresh_mhz;
+    bool current;               /* the mode the CRTC is actually running */
+} wcc_mode_t;
+
 typedef struct {
     char     name[WCC_MONITOR_NAME];
     int      x, y;              /* position in the virtual desktop */
@@ -47,6 +55,11 @@ typedef struct {
     int      refresh_mhz;
     bool     connected;         /* disconnected ports must never be advertised */
     bool     primary;
+    /* Every mode the output offers, best-first, with the active one flagged.  This is
+     * what a resolution menu needs: advertising only the CURRENT mode leaves the guest
+     * nothing to CHOOSE, which is not resolution support -- it is a readout. */
+    int         nmodes;
+    wcc_mode_t  modes[WCC_MAX_MODES];
 } wcc_monitor_t;
 
 typedef struct {

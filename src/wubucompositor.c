@@ -41,6 +41,8 @@
 #include <GL/gl.h>
 #include <GL/glx.h>
 #include <xkbcommon/xkbcommon.h>
+
+#include "wcc_monitors.h"
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
@@ -86,6 +88,12 @@ struct wcc_server {
     struct wl_event_loop *loop;
     struct wl_resource *compositor_res, *seat_res, *output_res, *wm_res;
     struct wcc_surface *app;
+
+    /* What is actually attached.  Replaces the previous single hardcoded output
+     * (geometry 0,0,0,0 and one fixed mode) with the real display's geometry, name,
+     * physical size and full mode list -- which is what resolution support needs:
+     * a guest can only CHOOSE from modes it was told about. */
+    wcc_monitors_t monitors;
 
     /* This compositor drives exactly one desktop.  The owner is remembered so
      * a second client is refused instead of silently sharing the seat -- two
@@ -645,12 +653,38 @@ static void output_bind(struct wl_client *c, void *data,
     s->output_res = wl_resource_create(c, &wl_output_interface, v, id);
     wl_resource_set_implementation(s->output_res, &output_impl, NULL,
                                    wcc_resource_destroy);
-    wl_output_send_geometry(s->output_res, 0, 0, 0, 0,
-                            WL_OUTPUT_SUBPIXEL_UNKNOWN, "", "",
+
+    /* Prefer the REAL primary display.  Discovery can fail (no X server at all), and
+     * then we fall back to the compiled-in default rather than advertising nothing --
+     * but never to invented geometry that claims a monitor exists where none does. */
+    const wcc_monitor_t *m = (s->monitors.count > 0) ? &s->monitors.m[0] : NULL;
+
+    wl_output_send_geometry(s->output_res,
+                            m ? m->x : 0, m ? m->y : 0,
+                            m ? m->mm_w : 0, m ? m->mm_h : 0,
+                            WL_OUTPUT_SUBPIXEL_UNKNOWN,
+                            m ? m->name : "", "",
                             WL_OUTPUT_TRANSFORM_NORMAL);
-    wl_output_send_mode(s->output_res, WL_OUTPUT_MODE_CURRENT |
-                        WL_OUTPUT_MODE_PREFERRED,
-                        WC_OUTPUT_W, WC_OUTPUT_H, 60000);
+
+    if (m && m->nmodes > 0) {
+        /* Advertise EVERY mode, flagging the live one.  This is the difference between
+         * a resolution readout and resolution SUPPORT: with only the current mode a
+         * client has nothing to choose. */
+        for (int i = 0; i < m->nmodes; i++) {
+            uint32_t flags = 0;
+            if (m->modes[i].current) flags |= WL_OUTPUT_MODE_CURRENT;
+            /* The first entry is XRandR's preferred mode. */
+            if (i == 0) flags |= WL_OUTPUT_MODE_PREFERRED;
+            wl_output_send_mode(s->output_res, flags,
+                                m->modes[i].w, m->modes[i].h,
+                                m->modes[i].refresh_mhz * 1000);
+        }
+    } else {
+        wl_output_send_mode(s->output_res, WL_OUTPUT_MODE_CURRENT |
+                            WL_OUTPUT_MODE_PREFERRED,
+                            WC_OUTPUT_W, WC_OUTPUT_H, 60000);
+    }
+
     if (v >= 2) wl_output_send_scale(s->output_res, 1);
     if (v >= 3) wl_output_send_done(s->output_res);
 }
@@ -1088,6 +1122,18 @@ int main(int argc, char **argv)
 
     wl_global_create(s->display, &wl_compositor_interface, 1, s, compositor_bind);
     wl_global_create(s->display, &wl_seat_interface, 1, s, seat_bind);
+    /* Discover displays BEFORE creating the output global, so the first bind
+     * already carries real geometry and modes. */
+    if (wcc_monitors_discover(&s->monitors) < 0) {
+        fprintf(stderr, "[wcc] no display enumerated; falling back to %dx%d\n",
+                WC_OUTPUT_W, WC_OUTPUT_H);
+    } else {
+        fprintf(stderr, "[wcc] display: %s %dx%d@%dHz, %d mode(s)\n",
+                s->monitors.m[0].name,
+                s->monitors.m[0].w, s->monitors.m[0].h,
+                s->monitors.m[0].refresh_mhz, s->monitors.m[0].nmodes);
+    }
+
     wl_global_create(s->display, &wl_output_interface, 2, s, output_bind);
     wl_global_create(s->display, &xdg_wm_base_interface, 1, s, wm_bind);
 
