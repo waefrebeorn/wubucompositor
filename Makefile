@@ -13,7 +13,7 @@ CFLAGS  += $(shell pkg-config --cflags wayland-server xkbcommon x11 xext glx) -I
 LIBS    := $(shell pkg-config --libs wayland-server xkbcommon x11 xext glx) -lm -lGL -lXrandr
 
 SRC := src/wubucompositor.c protocols/wayland-server-protocol.c \
-       src/wcc_monitors.c src/wcc_spawn.c \
+       src/wcc_monitors.c src/wcc_spawn.c src/wcc_gpu.c \
        protocols/xdg-shell-server-protocol.c
 BIN := wubucompositor
 

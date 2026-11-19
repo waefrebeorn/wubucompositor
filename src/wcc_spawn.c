@@ -19,6 +19,10 @@
 #include <unistd.h>
 #include <limits.h>
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>   /* _NSGetExecutablePath — macOS has no /proc */
+#endif
+
 /* Last-resort fallback only if /proc/self/exe is unreadable. Overridable
  * at build time (-DWUBU_GUEST_FALLBACK='"..."') for unusual layouts. */
 #ifndef WUBU_GUEST_FALLBACK
@@ -30,9 +34,23 @@ const char *wcc_default_start_cmd(void) {
     static int resolved = 0;
     if (!resolved) {
         resolved = 1;
+        int have_exe = 0;
+#if defined(__APPLE__)
+        /* macOS: no /proc. _NSGetExecutablePath may return a relative
+         * path; realpath it before walking up. */
+        uint32_t sz = (uint32_t)sizeof(path);
+        if (_NSGetExecutablePath(path, &sz) == 0) {
+            char real[PATH_MAX];
+            if (realpath(path, real)) {
+                snprintf(path, sizeof(path), "%s", real);
+            }
+            have_exe = 1;
+        }
+#else
         ssize_t n = readlink("/proc/self/exe", path, sizeof(path) - 1);
-        if (n > 0) {
-            path[n] = '\0';
+        if (n > 0) { path[n] = '\0'; have_exe = 1; }
+#endif
+        if (have_exe) {
             char *slash = strrchr(path, '/');
             if (slash) {
                 *slash = '\0';  /* now the executable's directory */

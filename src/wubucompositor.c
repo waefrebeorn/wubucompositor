@@ -27,19 +27,13 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
-#include <sys/syscall.h>
-#include <linux/memfd.h>
 #include <time.h>
 
 #include <wayland-server-core.h>
 #include <wayland-server-protocol.h>
 #include "xdg-shell-server-protocol.h"
 
-#include <X11/Xlib.h>
 #include <X11/cursorfont.h>
-#include <X11/extensions/XShm.h>
-#include <GL/gl.h>
-#include <GL/glx.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include "wcc_monitors.h"
@@ -50,19 +44,21 @@
 /* Output size.  Defaults; main() overwrites them with the X screen size so
  * the compositor fills the panel -- this is the product surface, not a
  * developer window. */
-static int WC_OUTPUT_W = 1024;
-static int WC_OUTPUT_H = 768;
+#include "wcc_internal.h"
+
+int WC_OUTPUT_W = 1024;
+int WC_OUTPUT_H = 768;
 #define BTN_LEFT 0x110
 #define BTN_MIDDLE 0x112
 #define BTN_RIGHT 0x111
 
-static uint32_t now_ms(void)
+uint32_t wcc_now_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
-static uint32_t next_serial(void)
+uint32_t wcc_next_serial(void)
 {
     static uint32_t s;
     return ++s;
@@ -70,100 +66,17 @@ static uint32_t next_serial(void)
 
 struct wcc_server;
 
-struct wcc_surface {
-    struct wcc_server *server;
-    struct wl_resource *resource;   /* wl_surface */
-    struct wl_resource *toplevel;   /* xdg_toplevel role resource */
-    bool configured;                /* xdg configure acked */
-    struct wl_resource *pending_buffer;
-    struct wl_shm_buffer *buf;
-    struct wl_resource *frame_cb;
-};
+
 
 /* impls referenced across record boundaries */
 static const struct xdg_surface_interface xdg_surface_impl;
 static const struct xdg_toplevel_interface xdg_toplevel_impl;
 
-/* One per advertised display.  A wl_output is a GLOBAL: binding it must yield THAT
- * output, not whichever one a single shared global happens to describe.  Each global
- * therefore carries its own context naming the monitor it belongs to. */
-typedef struct {
-    struct wcc_server *server;
-    wcc_monitor_t     *monitor;
-} wcc_output_ctx;
 
-struct wcc_server {
-    struct wl_display *display;
-    struct wl_event_loop *loop;
-    struct wl_resource *compositor_res, *seat_res, *wm_res;
-    /* Per-client bound output resources, one per advertised monitor.  A single cached
-     * pointer could only ever track one of them; after a client disconnect the rest
-     * would dangle and the next event would dereference freed memory. */
-    struct wl_resource *output_res[WCC_MAX_MONITORS];
-    int                 n_output_res;
-    struct wcc_surface *app;
 
-    /* What is actually attached.  Replaces the previous single hardcoded output
-     * (geometry 0,0,0,0 and one fixed mode) with the real display's geometry, name,
-     * physical size and full mode list -- which is what resolution support needs:
-     * a guest can only CHOOSE from modes it was told about. */
-    wcc_monitors_t monitors;
-    wcc_output_ctx output_ctx[WCC_MAX_MONITORS];
 
-    /* This compositor drives exactly one desktop.  The owner is remembered so
-     * a second client is refused instead of silently sharing the seat -- two
-     * clients on one seat produced "object from one client used for another"
-     * errors and an undefined pointer/keyboard state. */
-    struct wl_client *client;
-    struct wl_listener client_destroy;
 
-    Display *xd; Window xw;
-    int xfd;
-    int xd_focused;
-    XImage *ximg;
-    unsigned char *ximg_owner;
-    XShmSegmentInfo shm;
-    bool shm_ok;
 
-    /* GPU present (GLX).  When ok, the client's buffer is uploaded to a
-     * texture and drawn by the GPU; the XShm path becomes the fallback. */
-    struct {
-        bool ok;
-        XVisualInfo *vi;
-        Visual *visual;
-        int depth;
-        GLXContext ctx;
-        GLuint tex;
-        unsigned char *last;   /* last presented frame, for change detect */
-    } gpu;
-    /* self-screenshot: --screenshot PATH captures the window as PPM after
-     * the desktop's first commits, then exits 0 (headless-safe verify). */
-    const char *shot_path;
-    int shot_done;
-    int shot_commits;
-    int shot_delay_ms;
-    uint32_t shot_start_ms;
-
-    char *xkb_keymap_str;
-
-    struct {
-        struct wl_resource *pointer_res, *keyboard_res;
-        struct wcc_surface *focused;
-        double px, py;
-        uint32_t mods_depressed;   /* xkb modifier mask (wl_keyboard.modifiers) */
-        uint32_t mods_locked;      /* caps lock */
-    } seat;
-};
-
-/* xkb modifier mask bits, matching wl_keyboard.modifiers. */
-#define WCC_MOD_SHIFT   (1u << 0)
-#define WCC_MOD_LOCK    (1u << 1)
-#define WCC_MOD_CTRL    (1u << 2)
-#define WCC_MOD_ALT     (1u << 3)
-#define WCC_MOD_NUM     (1u << 4)
-#define WCC_MOD_MOD3    (1u << 5)
-#define WCC_MOD_SUPER   (1u << 6)
-#define WCC_MOD_MOD5    (1u << 7)
 
 /* Track a held modifier key (X keycodes) so wl_keyboard.modifiers reflects
  * the real state -- the client relies on it for shortcuts and text. */
@@ -184,7 +97,7 @@ static void seat_mod_key(struct wcc_server *s, uint32_t keycode, bool down)
 static void seat_send_modifiers(struct wcc_server *s)
 {
     if (!s->seat.keyboard_res) return;
-    wl_keyboard_send_modifiers(s->seat.keyboard_res, next_serial(),
+    wl_keyboard_send_modifiers(s->seat.keyboard_res, wcc_next_serial(),
                                s->seat.mods_depressed, s->seat.mods_locked,
                                0 /* latched */, 0 /* group */);
 }
@@ -226,65 +139,6 @@ static void surface_set_input(struct wl_client *c, struct wl_resource *r,
  * byte order B,G,R,00, which is exactly GL_BGRA.  Blending stays off, so the
  * unused alpha byte never reaches the panel. */
 
-static void gpu_destroy(struct wcc_server *s)
-{
-    if (!s->gpu.ok) return;
-    glXMakeCurrent(s->xd, None, NULL);
-    if (s->gpu.ctx) glXDestroyContext(s->xd, s->gpu.ctx);
-    if (s->gpu.tex) glDeleteTextures(1, &s->gpu.tex);
-    free(s->gpu.last);
-    if (s->gpu.vi) XFree(s->gpu.vi);
-    memset(&s->gpu, 0, sizeof s->gpu);
-}
-
-static void gpu_setup(struct wcc_server *s)
-{
-    const int w = WC_OUTPUT_W, h = WC_OUTPUT_H;
-    glViewport(0, 0, w, h);
-    glMatrixMode(GL_PROJECTION);
-    glLoadIdentity();
-    glOrtho(0, w, h, 0, -1, 1);
-    glMatrixMode(GL_MODELVIEW);
-    glLoadIdentity();
-    glDisable(GL_BLEND);
-    glDisable(GL_DEPTH_TEST);
-
-    glGenTextures(1, &s->gpu.tex);
-    glBindTexture(GL_TEXTURE_2D, s->gpu.tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_BGRA,
-                 GL_UNSIGNED_BYTE, NULL);
-
-    s->gpu.last = calloc((size_t)w * h * 4, 1);
-    if (!s->gpu.last) { gpu_destroy(s); return; }
-    s->gpu.ok = true;
-}
-
-static void gpu_present(struct wcc_server *s, const void *data,
-                        int w, int h, int stride)
-{
-    if (!s->gpu.ok) return;
-    glBindTexture(GL_TEXTURE_2D, s->gpu.tex);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, stride / 4);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_BGRA,
-                    GL_UNSIGNED_BYTE, data);
-    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-
-    glEnable(GL_TEXTURE_2D);
-    glColor4f(1.f, 1.f, 1.f, 1.f);
-    glBegin(GL_QUADS);
-        glTexCoord2f(0.f, 0.f); glVertex2f(0.f, 0.f);
-        glTexCoord2f(1.f, 0.f); glVertex2f((GLfloat)w, 0.f);
-        glTexCoord2f(1.f, 1.f); glVertex2f((GLfloat)w, (GLfloat)h);
-        glTexCoord2f(0.f, 1.f); glVertex2f(0.f, (GLfloat)h);
-    glEnd();
-    glDisable(GL_TEXTURE_2D);
-    glXSwapBuffers(s->xd, s->xw);
-}
-
 static void blit(struct wcc_server *s, struct wcc_surface *surf)
 {
     if (!surf->buf || !s->xw) return;
@@ -304,7 +158,7 @@ static void blit(struct wcc_server *s, struct wcc_surface *surf)
         if (memcmp(data, s->gpu.last, len) == 0)
             return;
         memcpy(s->gpu.last, data, len);
-        gpu_present(s, data, w, h, stride);
+        wcc_gpu_present(s, data, w, h, stride);
         return;
     }
 
@@ -371,7 +225,7 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r)
     struct wcc_surface *surf = wl_resource_get_user_data(r);
     struct wcc_server *s = surf->server;
     if (!surf->configured || !surf->pending_buffer) {
-        if (surf->frame_cb) { wl_callback_send_done(surf->frame_cb, now_ms());
+        if (surf->frame_cb) { wl_callback_send_done(surf->frame_cb, wcc_now_ms());
             wl_resource_destroy(surf->frame_cb); surf->frame_cb = NULL; }
         return;
     }
@@ -384,14 +238,14 @@ static void surface_commit(struct wl_client *c, struct wl_resource *r)
         /* self-screenshot: after a few settled commits, capture and stop. */
         if (s->shot_path && !s->shot_done) {
             s->shot_commits++;
-            uint32_t now = now_ms();
+            uint32_t now = wcc_now_ms();
             int due = s->shot_commits >= 4 &&
                       (int)(now - s->shot_start_ms) >= s->shot_delay_ms;
             if (due) wcc_capture_screenshot(s, WC_OUTPUT_W, WC_OUTPUT_H);
         }
     }
     surf->pending_buffer = NULL;
-    if (surf->frame_cb) { wl_callback_send_done(surf->frame_cb, now_ms());
+    if (surf->frame_cb) { wl_callback_send_done(surf->frame_cb, wcc_now_ms());
         wl_resource_destroy(surf->frame_cb); surf->frame_cb = NULL; }
 }
 
@@ -592,7 +446,12 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r,
 
     if (s->xkb_keymap_str) {
         size_t len = strlen(s->xkb_keymap_str);
-        int fd = syscall(SYS_memfd_create, "wcc-keymap", MFD_CLOEXEC);
+        /* POSIX shm works on Linux AND macOS (memfd_create is Linux-only).
+         * Unlink immediately: the fd stays valid, no filesystem residue. */
+        char shm_name[64];
+        snprintf(shm_name, sizeof shm_name, "/wcc-keymap-%d", (int)getpid());
+        int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+        if (fd >= 0) shm_unlink(shm_name);
         if (fd >= 0) {
             ftruncate(fd, (off_t)len);
             void *p = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -608,11 +467,11 @@ static void seat_get_keyboard(struct wl_client *c, struct wl_resource *r,
             wl_keyboard_send_repeat_info(s->seat.keyboard_res, 25, 600);
             struct wl_array empty = { 0 };
             if (s->app)
-                wl_keyboard_send_enter(s->seat.keyboard_res, next_serial(),
+                wl_keyboard_send_enter(s->seat.keyboard_res, wcc_next_serial(),
                                        s->app->resource, &empty);
             seat_send_modifiers(s);
             if (s->app && s->seat.pointer_res) {
-                wl_pointer_send_enter(s->seat.pointer_res, next_serial(),
+                wl_pointer_send_enter(s->seat.pointer_res, wcc_next_serial(),
                                       s->app->resource,
                                       wl_fixed_from_double(s->seat.px),
                                       wl_fixed_from_double(s->seat.py));
@@ -771,7 +630,7 @@ static void wm_bind(struct wl_client *c, void *data,
     s->wm_res = wl_resource_create(c, &xdg_wm_base_interface, version, id);
     wl_resource_set_implementation(s->wm_res, &wm_impl, s,
                                    wcc_resource_destroy);
-    xdg_wm_base_send_ping(s->wm_res, next_serial());
+    xdg_wm_base_send_ping(s->wm_res, wcc_next_serial());
 }
 
 /* --- xdg_surface --- */
@@ -792,7 +651,7 @@ static void xdg_surface_get_toplevel(struct wl_client *c,
     xdg_toplevel_send_configure(surf->toplevel, WC_OUTPUT_W, WC_OUTPUT_H,
                                 &states);
     /* the xdg_surface.configure must follow; use an incremented serial */
-    xdg_surface_send_configure(r, next_serial());
+    xdg_surface_send_configure(r, wcc_next_serial());
 }
 static void xdg_surface_get_popup(struct wl_client *c, struct wl_resource *r,
                                   uint32_t id, struct wl_resource *parent,
@@ -812,7 +671,7 @@ static void xdg_surface_ack_configure(struct wl_client *c,
     if (surf->server) {
         struct wcc_surface *a = surf->server->app;
         if (a == surf && surf->toplevel)
-            xdg_surface_send_configure(r, next_serial()); /* steady-state */
+            xdg_surface_send_configure(r, wcc_next_serial()); /* steady-state */
     }
 }
 static const struct xdg_surface_interface xdg_surface_impl = {
@@ -910,13 +769,13 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
             s->seat.py = ev.xmotion.y;
             if (s->app && s->seat.pointer_res) {
                 if (s->seat.focused != s->app) {
-                    wl_pointer_send_enter(s->seat.pointer_res, next_serial(),
+                    wl_pointer_send_enter(s->seat.pointer_res, wcc_next_serial(),
                                           s->app->resource,
                                           wl_fixed_from_double(s->seat.px),
                                           wl_fixed_from_double(s->seat.py));
                     s->seat.focused = s->app;
                 }
-                wl_pointer_send_motion(s->seat.pointer_res, now_ms(),
+                wl_pointer_send_motion(s->seat.pointer_res, wcc_now_ms(),
                                        wl_fixed_from_double(s->seat.px),
                                        wl_fixed_from_double(s->seat.py));
                 wl_pointer_send_frame(s->seat.pointer_res);
@@ -935,14 +794,14 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
                 /* A click with no prior motion must still carry the pointer
                  * position, or the client sees the press at (0,0). */
                 if (s->seat.focused != s->app && s->app) {
-                    wl_pointer_send_enter(s->seat.pointer_res, next_serial(),
+                    wl_pointer_send_enter(s->seat.pointer_res, wcc_next_serial(),
                                           s->app->resource,
                                           wl_fixed_from_double(s->seat.px),
                                           wl_fixed_from_double(s->seat.py));
                     s->seat.focused = s->app;
                 }
-                wl_pointer_send_button(s->seat.pointer_res, next_serial(),
-                                       now_ms(), btn, down ?
+                wl_pointer_send_button(s->seat.pointer_res, wcc_next_serial(),
+                                       wcc_now_ms(), btn, down ?
                                        WL_POINTER_BUTTON_STATE_PRESSED :
                                        WL_POINTER_BUTTON_STATE_RELEASED);
                 wl_pointer_send_frame(s->seat.pointer_res);
@@ -954,8 +813,8 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
             bool down = ev.type == KeyPress;
             seat_mod_key(s, ev.xkey.keycode, down);
             if (s->seat.keyboard_res && s->app) {
-                wl_keyboard_send_key(s->seat.keyboard_res, next_serial(),
-                                     now_ms(),
+                wl_keyboard_send_key(s->seat.keyboard_res, wcc_next_serial(),
+                                     wcc_now_ms(),
                                      ev.xkey.keycode > 8 ? ev.xkey.keycode - 8 : 0,
                                      down ?
                                      WL_KEYBOARD_KEY_STATE_PRESSED :
@@ -968,7 +827,7 @@ static int x11_dispatch(int fd, uint32_t mask, void *data)
         }
         case LeaveNotify:
             if (s->seat.pointer_res && s->seat.focused) {
-                wl_pointer_send_leave(s->seat.pointer_res, next_serial(),
+                wl_pointer_send_leave(s->seat.pointer_res, wcc_next_serial(),
                                       s->seat.focused->resource);
                 s->seat.focused = NULL;
             }
@@ -1008,7 +867,7 @@ int main(int argc, char **argv)
     if (shot_path) {
         s->shot_path = shot_path;
         s->shot_delay_ms = shot_delay > 0 ? shot_delay : 0;
-        s->shot_start_ms = now_ms();
+        s->shot_start_ms = wcc_now_ms();
         fprintf(stderr,
                 "WuBuCompositor: --screenshot %s delay=%d ms (self-capture)\n",
                 shot_path, s->shot_delay_ms);
@@ -1069,7 +928,7 @@ int main(int argc, char **argv)
     if (s->gpu.vi) {
         s->gpu.ctx = glXCreateContext(s->xd, s->gpu.vi, NULL, True);
         if (s->gpu.ctx && glXMakeCurrent(s->xd, s->xw, s->gpu.ctx)) {
-            gpu_setup(s);
+            wcc_gpu_setup(s);
             fprintf(stderr, "WuBuCompositor: GPU present active (GLX)\n");
         } else {
             fprintf(stderr, "WuBuCompositor: GLX unavailable, CPU blit\n");
