@@ -1,3 +1,4 @@
 wubucompositor
 *.o
 *.log
+test_wcc_spawn

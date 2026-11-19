@@ -1,3 +1,8 @@
+/* LEGACY — NOT BUILT. The original wlroots-based entry point, replaced by
+ * src/wubucompositor.c (the slerm: libwayland-server + Xlib + GLX, no
+ * wlroots). The Makefile compiles only the slerm. Kept for history; the
+ * wlroots description below is stale by design. Candidate for removal —
+ * owner decision (see the hardcoding census ledger). */
 /*
  * WuBuCompositor -- the WuBuOS compositor.
  *

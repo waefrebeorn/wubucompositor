@@ -43,6 +43,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include "wcc_monitors.h"
+#include "wcc_spawn.h"
 #include <sys/ipc.h>
 #include <sys/shm.h>
 
@@ -1175,19 +1176,9 @@ int main(int argc, char **argv)
     if (!sock) return 1;
     setenv("WAYLAND_DISPLAY", sock, 1);
 
-    /* The guest is spawned here so `./wubucompositor` alone brings up the
-     * desktop.  WUBU_NO_SPAWN=1 skips that, which is what you want when you are
-     * starting the guest yourself -- spawning a second one only produced two
-     * clients fighting over one seat. */
-    const char *no_spawn = getenv("WUBU_NO_SPAWN");
-    if (!(no_spawn && *no_spawn && no_spawn[0] != '0')) {
-        const char *start = getenv("WUBU_START_CMD");
-        if (!start || !*start) start = "/home/wubu/wubuos/src/hosted/wubu";
-        pid_t pid = fork();
-        if (pid == 0) { execl("/bin/sh", "sh", "-c", start, (char *)NULL); _exit(127); }
-    } else {
-        fprintf(stderr, "WuBuCompositor: WUBU_NO_SPAWN set; waiting for a client\n");
-    }
+    /* Guest launch: one owner (wcc_spawn.c) — env knobs + a default path
+     * derived from the binary's own location, not a hardcoded /home. */
+    wcc_spawn_guest();
 
     fprintf(stderr, "WuBuCompositor: socket=%s output=%dx%d\n",
             sock, WC_OUTPUT_W, WC_OUTPUT_H);

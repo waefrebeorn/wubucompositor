@@ -13,7 +13,7 @@ CFLAGS  += $(shell pkg-config --cflags wayland-server xkbcommon x11 xext glx) -I
 LIBS    := $(shell pkg-config --libs wayland-server xkbcommon x11 xext glx) -lm -lGL -lXrandr
 
 SRC := src/wubucompositor.c protocols/wayland-server-protocol.c \
-       src/wcc_monitors.c \
+       src/wcc_monitors.c src/wcc_spawn.c \
        protocols/xdg-shell-server-protocol.c
 BIN := wubucompositor
 
@@ -30,7 +30,12 @@ run: $(BIN)
 test: $(BIN)
 	./wcc_test.sh
 
-clean:
-	rm -f $(BIN)
+# Headless behaviour gate for the guest-launch leaf (no X needed).
+test-spawn: src/wcc_spawn.c src/test_wcc_spawn.c
+	$(CC) $(CFLAGS) -o test_wcc_spawn src/wcc_spawn.c src/test_wcc_spawn.c
+	./test_wcc_spawn
 
-.PHONY: all run test clean
+clean:
+	rm -f $(BIN) test_wcc_spawn
+
+.PHONY: all run test test-spawn clean
